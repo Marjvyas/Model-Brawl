@@ -1,0 +1,48 @@
+{
+  "steps": [
+    {
+      "step_id": 0,
+      "file": "snap_0.csv",
+      "action": "Upload Dataset",
+      "timestamp": 1791177439.8686738,
+      "columns": [
+        "Age",
+        "Gender",
+        "Country",
+        "Academic_Level",
+        "Most_Used_Platform",
+        "Purpose_Of_Use",
+        "Avg_Daily_Usage_Hours",
+        "Daily_Unlocks",
+        "Study_Hours",
+        "Physical_Activity_Hours",
+        "Sleep_Hours_Per_Night",
+        "Stress_Level",
+        "Mental_Health_Score"
+      ],
+      "rows": 5000
+    },
+    {
+      "step_id": 1,
+      "file": "snap_1.csv",
+      "action": "Delete column 'Age'",
+      "timestamp": 1791177613.542307,
+      "columns": [
+        "Gender",
+        "Country",
+        "Academic_Level",
+        "Most_Used_Platform",
+        "Purpose_Of_Use",
+        "Avg_Daily_Usage_Hours",
+        "Daily_Unlocks",
+        "Study_Hours",
+        "Physical_Activity_Hours",
+        "Sleep_Hours_Per_Night",
+        "Stress_Level",
+        "Mental_Health_Score"
+      ],
+      "rows": 5000
+    }
+  ],
+  "current_index": 1
+}

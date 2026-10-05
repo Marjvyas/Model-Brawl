@@ -1,0 +1,44 @@
+{
+  "steps": [
+    {
+      "step_id": 0,
+      "file": "snap_0.csv",
+      "action": "Upload Dataset",
+      "timestamp": 1791169430.9021964,
+      "columns": [
+        "Unnamed: 0",
+        "carat",
+        "cut",
+        "color",
+        "clarity",
+        "depth",
+        "table",
+        "x",
+        "y",
+        "z",
+        "price"
+      ],
+      "rows": 53940
+    },
+    {
+      "step_id": 1,
+      "file": "snap_1.csv",
+      "action": "Delete column 'Unnamed: 0'",
+      "timestamp": 1791169442.6806533,
+      "columns": [
+        "carat",
+        "cut",
+        "color",
+        "clarity",
+        "depth",
+        "table",
+        "x",
+        "y",
+        "z",
+        "price"
+      ],
+      "rows": 53940
+    }
+  ],
+  "current_index": 1
+}

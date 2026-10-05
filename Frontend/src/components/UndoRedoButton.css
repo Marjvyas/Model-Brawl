@@ -1,0 +1,76 @@
+/* Minimal Floating Undo / Redo Button */
+.undo-redo-floating-container {
+  position: fixed;
+  top: 22px;
+  right: 28px;
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: #151a23;
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border: 1px solid rgba(0, 255, 128, 0.4);
+  border-radius: 30px;
+  padding: 5px 12px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.6), 0 0 16px rgba(0, 255, 128, 0.25);
+  animation: undoPillPop 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  
+  
+}
+
+@keyframes undoPillPop {
+  0% {
+    opacity: 0;
+    transform: translateY(-8px) scale(0.95);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.undo-redo-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: transparent;
+  border: none;
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 0.82rem;
+  font-weight: 700;
+  cursor: pointer;
+  /* padding: 5px 12px; */
+  /* border-radius: 20px; */
+  transition: all 0.2s ease;
+  /* outline: none; */
+  /* letter-spacing: 0.3px; */
+  width: 50px;
+}
+
+.undo-redo-btn.undo-btn {
+  color: #00FF80;
+}
+
+.undo-redo-floating-container:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.6), 0 0 16px rgba(0, 255, 128, 0.25);
+}
+
+.undo-redo-btn.redo-btn {
+  color: #00F0FF;
+}
+
+
+.undo-redo-btn:active {
+  transform: translateY(0);
+}
+
+@media (max-width: 768px) {
+  .undo-redo-floating-container {
+    top: 14px;
+    right: 14px;
+    padding: 4px 8px;
+  }
+}

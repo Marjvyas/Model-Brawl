@@ -1,0 +1,85 @@
+/* --- Clean Custom Select Fix --- */
+
+.custom-select-container {
+  position: relative;
+  width: max-content; /* Dynamically sizes to fit full option text */
+  min-width: 180px;   /* Guarantees enough room for "N-1 Hot Encoding" */
+  font-family: var(--font-mono, monospace);
+}
+
+/* Closed Trigger Button */
+.custom-select-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: rgba(255, 255, 255, 0.04);
+  color: #e2e8f0;
+  font-size: 0.8rem;
+  font-weight: 500;
+  padding: 8px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap; /* PREVENTS TEXT FROM WRAPPING ONTO TWO LINES */
+  user-select: none;
+  transition: all 0.15s ease;
+}
+
+.custom-select-trigger:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.25);
+}
+
+.custom-select-trigger.is-open {
+  border-color: #38bdf8;
+  background: #0f172a;
+}
+
+.chevron-icon {
+  color: #64748b;
+  transition: transform 0.15s ease;
+  flex-shrink: 0;
+}
+
+.chevron-icon.rotate {
+  transform: rotate(180deg);
+}
+
+/* Floating Options Popup */
+.custom-select-options {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  width: 100%;
+  min-width: 200px;
+  background: #0f172a;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 6px;
+  box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.6);
+  z-index: 10000; /* Higher z-index to stay above modal cards */
+  padding: 4px;
+  box-sizing: border-box;
+}
+
+/* Individual Option Items */
+.custom-option {
+  padding: 8px 12px;
+  font-size: 0.8rem;
+  color: #94a3b8;
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.12s ease;
+}
+
+.custom-option:hover {
+  background: rgba(56, 189, 248, 0.12);
+  color: #38bdf8;
+}
+
+.custom-option.is-selected {
+  background: rgba(255, 255, 255, 0.12);
+  color: #ffffff;
+  font-weight: 600;
+}
