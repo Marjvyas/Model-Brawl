@@ -1,0 +1,27 @@
+{
+  "steps": [
+    {
+      "step_id": 0,
+      "file": "snap_0.csv",
+      "action": "Upload Dataset",
+      "timestamp": 1791438802.2631338,
+      "columns": [
+        "Age",
+        "Gender",
+        "Country",
+        "Academic_Level",
+        "Most_Used_Platform",
+        "Purpose_Of_Use",
+        "Avg_Daily_Usage_Hours",
+        "Daily_Unlocks",
+        "Study_Hours",
+        "Physical_Activity_Hours",
+        "Sleep_Hours_Per_Night",
+        "Stress_Level",
+        "Mental_Health_Score"
+      ],
+      "rows": 5000
+    }
+  ],
+  "current_index": 0
+}

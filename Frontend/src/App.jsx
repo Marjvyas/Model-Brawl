@@ -323,8 +323,8 @@ function AppContent() {
 
   // ── Sandbox Handlers ──
   const handleOpenSandbox = () => {
-    if (!taskId) {
-      alert("Please run the pipeline first before opening the sandbox.");
+    if (!taskId && !uploadData) {
+      alert("Please upload a dataset first before opening the sandbox.");
       return;
     }
     setSandboxOpen(true);
@@ -346,7 +346,7 @@ function AppContent() {
     }
     setSandboxOpen(false);
     setSandboxEncodingRequired(null);
-    if (data.eda_payload && data.dataset_analysis) {
+    if (data.eda_payload && data.dataset_analysis && taskId) {
       const cacheKey = `dataset_${taskId}`;
       try {
         localStorage.setItem(cacheKey, JSON.stringify({

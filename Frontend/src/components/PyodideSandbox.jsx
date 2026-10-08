@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import EncodingModal from './EncodingModal';
 
 const PyodideSandbox = ({ 
@@ -12,8 +12,6 @@ const PyodideSandbox = ({
   onEncodingRequired 
 }) => {
   const taskId = externalTaskId;
-  const hasProcessedData = Boolean(taskId);
-  const isNewSandbox = isOpen && !hasProcessedData && uploadData;
   const encodingConfig = contextEncodingConfig || {};
   
   const [status, setStatus] = useState('Initializing...');
@@ -26,11 +24,13 @@ const PyodideSandbox = ({
   const [loadingStep, setLoadingStep] = useState('');
   const [showOutputPanel, setShowOutputPanel] = useState(true);
   const [encodingModalData, setEncodingModalData] = useState(null);
+  const [pyodideInstance, setPyodideInstance] = useState(null);
   
   const pyodideRef = useRef(null);
   const editorRef = useRef(null);
   const monacoContainerRef = useRef(null);
   const saveIntervalRef = useRef(null);
+  const pyodideLoadedRef = useRef(false);
 
   const DEFAULT_CODE = `# Auto-loaded DataFrame
 # Type 'print(df.head())' to see data
@@ -41,19 +41,37 @@ print("DataFrame loaded:", df.shape)
 print("Columns:", list(df.columns))
 `;
 
-  useEffect(() => {
-    if (isOpen && (taskId || uploadData)) {
-      initSandbox();
-    }
+  // Load Pyodide script dynamically
+  const loadPyodideScript = useCallback(() => {
+    if (pyodideLoadedRef.current) return Promise.resolve();
     
-    return () => {
-      if (saveIntervalRef.current) {
-        clearInterval(saveIntervalRef.current);
+    return new Promise((resolve, reject) => {
+      // Check if script already exists
+      const existingScript = document.querySelector('script[src*="pyodide"]');
+      if (existingScript) {
+        pyodideLoadedRef.current = true;
+        return resolve();
       }
-    };
-  }, [isOpen, taskId, uploadData]);
+      
+      // Check if loadPyodide is already available
+      if (window.loadPyodide) {
+        pyodideLoadedRef.current = true;
+        return resolve();
+      }
+      
+      const script = document.createElement('script');
+      script.src = 'https://cdn.jsdelivr.net/pyodide/v0.23.4/full/pyodide.js';
+      script.onload = () => {
+        pyodideLoadedRef.current = true;
+        resolve();
+      };
+      script.onerror = (e) => reject(new Error('Failed to load Pyodide'));
+      document.body.appendChild(script);
+    });
+  }, []);
 
-  const initMonaco = () => {
+  const initMonaco = useCallback(() => {
+    if (editorRef.current) return;
     if (!window.require) {
       const script = document.createElement('script');
       script.src = 'https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.6/require.min.js';
@@ -83,7 +101,7 @@ print("Columns:", list(df.columns))
         });
       }
     });
-  };
+  }, []);
 
   const setSandboxLoading = (step) => {
     setIsLoading(true);
@@ -96,24 +114,68 @@ print("Columns:", list(df.columns))
     setStatus('Environment Ready ✓');
   };
 
-  const initSandbox = async () => {
-    if (!taskId) {
-      setStatus('Error: No task found. Complete EDA first.');
-      return;
+  const loadDataset = useCallback(async (pyodide, targetId) => {
+    let response;
+    
+    if (targetId && targetId !== uploadData?.stored_as) {
+      // Use task_id endpoint for processed data
+      response = await fetch(`/api/dataset/${targetId}`);
+      if (!response.ok) {
+        throw new Error('Could not fetch processed dataset. Complete EDA first.');
+      }
+    } else if (uploadData && uploadData.stored_as) {
+      // Use raw_dataset endpoint for pre-pipeline data
+      response = await fetch(`/api/raw_dataset/${uploadData.stored_as}`);
+      if (!response.ok) {
+        throw new Error('Could not fetch raw dataset. Upload first.');
+      }
+    } else {
+      throw new Error('No dataset available. Upload a CSV file first.');
     }
+    
+    const csvData = await response.text();
+    pyodide.FS.writeFile('/dataset.csv', csvData);
 
+    await pyodide.runPythonAsync(`
+import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from io import StringIO
+import base64
+df = pd.read_csv('/dataset.csv')
+
+import sys
+main = sys.modules['__main__']
+main.df = df
+main.pd = pd
+main.np = np
+main.plt = plt
+plt.ioff()
+    `);
+
+    await pyodide.runPythonAsync(`
+original_dtypes = df.dtypes.to_dict()
+print(f"Loaded {len(df)} rows × {len(df.columns)} columns")
+    `);
+  }, [uploadData]);
+
+  const initSandbox = useCallback(async () => {
+    // For pre-pipeline sandbox, use uploadData if available
+    const targetTaskId = taskId || (uploadData && uploadData.stored_as ? uploadData.stored_as : null);
+    
     try {
       setSandboxLoading('Loading Pyodide engine...');
       
+      // Load Pyodide script if not already loaded
+      await loadPyodideScript();
+      
       if (!window.loadPyodide) {
-        setStatus('Waiting for Pyodide to load...');
-        await new Promise(resolve => {
-          const check = () => {
-            if (window.loadPyodide) resolve();
-            else setTimeout(check, 100);
-          };
-          check();
-        });
+        setStatus('Error: Pyodide failed to load.');
+        setError('Could not load Python environment from CDN.');
+        setIsLoading(false);
+        return;
       }
 
       setSandboxLoading('Initializing Python environment...');
@@ -123,9 +185,10 @@ print("Columns:", list(df.columns))
         stderr: (msg) => setOutput(prev => prev + msg + '\n')
       });
       pyodideRef.current = pyodide;
+      setPyodideInstance(pyodide);
 
       setSandboxLoading('Loading pandas & matplotlib...');
-      await pyodide.loadPackage(['pandas', 'matplotlib']);
+      await pyodide.loadPackage(['pandas', 'matplotlib', 'micropip']);
 
       pyodide.runPython(`
 import matplotlib
@@ -133,65 +196,31 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from io import StringIO
 import base64
+import sys
+main = sys.modules['__main__']
+main.plt = plt
       `);
 
       setSandboxLoading('Loading dataset...');
-      await loadDataset(pyodide);
+      await loadDataset(pyodide, targetTaskId);
 
+      setSandboxLoading('Initializing code editor...');
       initMonaco();
       
       setSandboxReady();
       setOutput('');
       setError('');
+      setEncodingModalData(null);
+      
     } catch (e) {
       console.error(e);
       setStatus('Initialization Failed');
       setError(e.message || 'Unknown error');
       setIsLoading(false);
     }
-  };
+  }, [taskId, uploadData, loadPyodideScript, loadDataset, initMonaco]);
 
-  const loadDataset = async (pyodide) => {
-    let response;
-    
-    if (taskId) {
-      response = await fetch(`/api/dataset/${taskId}`);
-      if (!response.ok) {
-        throw new Error('Could not fetch dataset. Complete EDA first.');
-      }
-    } else if (uploadData && uploadData.stored_as) {
-      response = await fetch(`/api/raw_dataset/${uploadData.stored_as}`);
-      if (!response.ok) {
-        throw new Error('Could not fetch raw dataset.');
-      }
-    } else {
-      throw new Error('No dataset available. Run pipeline first.');
-    }
-    
-    const csvData = await response.text();
-    pyodide.FS.writeFile('/dataset.csv', csvData);
-
-    await pyodide.runPythonAsync(`
-import pandas as pd
-import numpy as np
-df = pd.read_csv('/dataset.csv')
-
-import sys
-main = sys.modules['__main__']
-main.df = df
-main.pd = pd
-main.np = np
-
-plt.ioff()
-      `);
-
-    await pyodide.runPythonAsync(`
-original_dtypes = df.dtypes.to_dict()
-print(f"Loaded {len(df)} rows × {len(df.columns)} columns")
-      `);
-  };
-
-  const handleRunCode = async () => {
+  const handleRunCode = useCallback(async () => {
     if (!editorRef.current || !pyodideRef.current) return;
     
     const code = editorRef.current.getValue();
@@ -213,16 +242,16 @@ import matplotlib.pyplot as plt
 
 new_plots = []
 for i in plt.get_fignums():
-    try {
-        fig = plt.get_fig(i)
-        buf = StringIO()
-        fig.savefig(buf, format='png', dpi=80, bbox_inches='tight')
-        buf.seek(0)
-        img_str = base64.b64encode(buf.read()).decode('utf-8')
-        new_plots.append(img_str)
-        plt.close(fig)
-    except:
-        pass
+  try:
+    fig = plt.get_fig(i)
+    buf = StringIO()
+    fig.savefig(buf, format='png', dpi=80, bbox_inches='tight')
+    buf.seek(0)
+    img_str = base64.b64encode(buf.read()).decode('utf-8')
+    new_plots.append(img_str)
+    plt.close(fig)
+  except:
+    pass
 
 plt.ioff()
 json.dumps(new_plots)
@@ -241,9 +270,9 @@ json.dumps(new_plots)
     } finally {
       setIsRunning(false);
     }
-  };
+  }, []);
 
-  const extractModifiedDf = async () => {
+  const extractModifiedDf = useCallback(async () => {
     if (!pyodideRef.current) return null;
     
     try {
@@ -253,9 +282,9 @@ json.dumps(new_plots)
       console.error('Failed to extract dataframe:', e);
       return null;
     }
-  };
+  }, []);
 
-  const handleCommit = async () => {
+  const handleCommit = useCallback(async () => {
     if (!pyodideRef.current || !taskId) return;
     
     setIsRunning(true);
@@ -308,9 +337,9 @@ json.dumps(new_plots)
     } finally {
       setIsRunning(false);
     }
-  };
+  }, [taskId, extractModifiedDf, onDatasetUpdate]);
 
-  const handleEncodingConfirm = async (newConfig) => {
+  const handleEncodingConfirm = useCallback(async (newConfig) => {
     const mergedConfig = {
       ...encodingModalData.temporary_state,
       ...newConfig
@@ -353,22 +382,46 @@ json.dumps(new_plots)
     } finally {
       setIsRunning(false);
     }
-  };
+  }, [encodingModalData, extractModifiedDf, taskId, onDatasetUpdate]);
 
-  const handleReset = () => {
+  const handleReset = useCallback(() => {
     setOutput('');
     setPlots([]);
     setError('');
     setEncodingModalData(null);
     setIsCommitted(false);
     setStatus('Environment Ready ✓');
-  };
+  }, []);
 
-  const toggleOutputPanel = () => {
+  const toggleOutputPanel = useCallback(() => {
     setShowOutputPanel(!showOutputPanel);
-  };
+  }, []);
 
-  if (!isOpen && !encodingModalData) return null;
+  const handleCloseSandbox = useCallback(() => {
+    onClose();
+    setOutput('');
+    setPlots([]);
+    setError('');
+  }, [onClose]);
+
+  // Initialize sandbox when opened
+  useEffect(() => {
+    if (isOpen && (taskId || uploadData)) {
+      initSandbox();
+    }
+  }, [isOpen, taskId, uploadData, initSandbox]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (saveIntervalRef.current) {
+        clearInterval(saveIntervalRef.current);
+      }
+    };
+  }, []);
+
+  // Don't render if closed
+  if (!isOpen) return null;
 
   // Loading overlay styles
   const loadingOverlayStyle = {
@@ -574,6 +627,35 @@ json.dumps(new_plots)
     flexShrink: 0,
   };
 
+  // Show encoding modal if encoding is required
+  if (encodingModalData) {
+    return (
+      <div className="proc-overlay">
+        <div className="encoding-modal-content">
+          <div className="encoding-modal-header">
+            <h2>Configure Categorical Encoding</h2>
+            <div className="encoding-progress-track">
+              <div
+                className="encoding-progress-fill"
+                style={{ width: '100%' }}
+              ></div>
+            </div>
+          </div>
+          <div className="encoding-modal-body">
+            <EncodingModal
+              cols={encodingModalData?.unmapped_columns}
+              catInfo={encodingModalData?.cat_info}
+              initialConfig={encodingModalData?.temporary_state}
+              onConfirm={handleEncodingConfirm}
+              onCancel={() => setEncodingModalData(null)}
+              isForgeEncoding={false}
+            />
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <>
       {/* Add keyframes animation for sandbox spinner */}
@@ -587,243 +669,217 @@ json.dumps(new_plots)
         }
       `}</style>
       
-      {!isOpen ? (
-        <div className="proc-overlay">
-          <div className="encoding-modal-content">
-            <div className="encoding-modal-header">
-              <h2>Configure Categorical Encoding</h2>
-              <div className="encoding-progress-track">
-                <div
-                  className="encoding-progress-fill"
-                  style={{ width: '100%' }}
-                ></div>
-              </div>
-            </div>
-            <div className="encoding-modal-body">
-              <EncodingModal
-                cols={encodingModalData?.unmapped_columns}
-                catInfo={encodingModalData?.cat_info}
-                initialConfig={encodingModalData?.temporary_state}
-                onConfirm={handleEncodingConfirm}
-                onCancel={() => setEncodingModalData(null)}
-                isForgeEncoding={false}
-              />
-            </div>
+      <div style={containerStyle} onClick={e => e.stopPropagation()}>
+        {/* Status Bar */}
+        <div style={headerStyle}>
+          <div style={titleSectionStyle}>
+            <h3 style={{ margin: 0, fontWeight: 600, fontSize: '1.1rem' }}>Interactive Python Sandbox</h3>
+            <span style={statusBadgeStyle}>{status}</span>
           </div>
+          <button 
+            onClick={handleCloseSandbox}
+            style={{
+              background: 'none',
+              border: 'none',
+              color: '#94a3b8',
+              cursor: 'pointer',
+              fontSize: '1.8rem',
+              padding: 0,
+              width: '32px',
+              height: '32px',
+              borderRadius: '8px',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              transition: 'all 0.2s ease',
+              margin: 0,
+            }}
+            title="Close Sandbox"
+          >
+            ×
+          </button>
         </div>
-      ) : (
-        <div style={containerStyle} onClick={e => e.stopPropagation()}>
-          {/* Status Bar */}
-          <div style={headerStyle}>
-            <div style={titleSectionStyle}>
-              <h3 style={{ margin: 0, fontWeight: 600, fontSize: '1.1rem' }}>Interactive Python Sandbox</h3>
-              <span style={statusBadgeStyle}>{status}</span>
-            </div>
-            <button 
-              onClick={onClose}
-              style={{
-                background: 'none',
-                border: 'none',
-                color: '#94a3b8',
-                cursor: 'pointer',
-                fontSize: '1.8rem',
-                padding: 0,
-                width: '32px',
-                height: '32px',
-                borderRadius: '8px',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                transition: 'all 0.2s ease',
-                margin: 0,
-              }}
-              title="Close Sandbox"
-            >
-              ×
-            </button>
-          </div>
 
-          {/* Loading Overlay */}
-          {isLoading && (
-            <div style={loadingOverlayStyle}>
-              <div style={loadingContentStyle}>
-                <div style={spinnerStyle}></div>
-                <div style={{ 
-                  color: '#f8fafc', 
-                  fontSize: '1.1rem', 
-                  fontWeight: 600,
-                  fontFamily: 'Inter, system-ui, sans-serif'
-                }}>{loadingStep}</div>
-                <div style={{ 
-                  color: '#94a3b8', 
-                  fontSize: '0.85rem',
-                  fontFamily: 'JetBrains Mono, Fira Code, monospace'
-                }}>
-                  Please wait while the Python environment initializes...
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* Main Content Area */}
-          <div style={mainStyle}>
-            {/* Left Side - Code Editor */}
-            <div style={editorSectionStyle}>
-              <div style={toolbarStyle}>
-                <div style={toolbarInfoStyle}>
-                  <span style={{
-                    background: 'rgba(6, 182, 212, 0.15)',
-                    color: '#06b6d4',
-                    fontSize: '0.65rem',
-                    fontWeight: 700,
-                    padding: '2px 8px',
-                    borderRadius: '4px',
-                    textTransform: 'uppercase',
-                  }}>Python</span>
-                  <span style={{ 
-                    color: '#94a3b8', 
-                    fontSize: '0.75rem' 
-                  }}>workspace.py</span>
-                </div>
-                <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                  <button
-                    style={botBtnStyle(true)}
-                    onClick={handleRunCode}
-                    disabled={isRunning || !pyodideRef.current || isLoading}
-                    title="Run Code (Ctrl+Enter)"
-                  >
-                    {isRunning ? (
-                      <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                        <span style={{
-                          display: 'inline-block',
-                          width: '8px',
-                          height: '8px',
-                          background: '#06b6d4',
-                          borderRadius: '50%',
-                          animation: 'pulse 1.2s ease-in-out infinite',
-                        }}></span>
-                        Running...
-                      </span>
-                    ) : (
-                      <span>▶ Run</span>
-                    )}
-                  </button>
-                  <button
-                    style={botBtnStyle(false)}
-                    onClick={handleCommit}
-                    disabled={isRunning || !pyodideRef.current || isLoading}
-                    title="Commit changes to dataset"
-                  >
-                    {isCommitted ? '✓ Saved' : '💾 Commit'}
-                  </button>
-                  <button
-                    style={{
-                      background: 'transparent',
-                      color: '#94a3b8',
-                      border: '1px solid #374151',
-                      borderRadius: '6px',
-                      padding: '8px 14px',
-                      fontSize: '0.8rem',
-                      cursor: 'pointer',
-                      transition: 'all 0.2s ease',
-                    }}
-                    onClick={handleReset}
-                    disabled={isRunning}
-                    title="Reset output"
-                  >
-                    🔄 Reset
-                  </button>
-                </div>
-              </div>
-
-              <div
-                ref={monacoContainerRef}
-                style={bot}
-              />
-            </div>
-
-            {/* Right Side - Output Panel */}
-            {showOutputPanel && (
-              <div style={outputSectionStyle}>
-                <div style={outputHeaderStyle}>
-                  <span>Output</span>
-                  <button 
-                    onClick={toggleOutputPanel}
-                    style={toggleBtnStyle}
-                    title="Toggle Output Panel"
-                  >
-                    {showOutputPanel ? '←' : '→'}
-                  </button>
-                </div>
-                
-                <div style={outputContainerStyle}>
-                  {plots.length > 0 && (
-                    <div style={plotsSectionStyle}>
-                      <div style={{ 
-                        color: '#94a3b8', 
-                        fontSize: '0.7rem', 
-                        textTransform: 'uppercase',
-                        letterSpacing: '0.5px',
-                        marginBottom: '10px',
-                        paddingBottom: '8px',
-                        borderBottom: '1px solid #374151',
-                      }}>Matplotlib Plots</div>
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                        {plots.map((plot, idx) => (
-                          <div key={idx} style={plotCardStyle}>
-                            <img
-                              src={`data:image/png;base64,${plot}`}
-                              alt={`Plot ${idx + 1}`}
-                              style={{
-                                maxWidth: '100%',
-                                height: 'auto',
-                                borderRadius: '6px',
-                              }}
-                            />
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                  
-                  <div style={consoleStyle}>
-                    <pre style={{
-                      margin: 0,
-                      fontFamily: 'JetBrains Mono, Fira Code, monospace',
-                      fontSize: '0.75rem',
-                      lineHeight: 1.9,
-                      color: '#6ee7b7',
-                      whiteSpace: 'pre-wrap',
-                    }}>
-                      {output || 'Output will appear here...'}
-                    </pre>
-                  </div>
-                </div>
-              </div>
-            )}
-          </div>
-
-          {/* Error Section */}
-          {error && !isCommitted && (
-            <div style={errorSectionStyle}>
+        {/* Loading Overlay */}
+        {isLoading && (
+          <div style={loadingOverlayStyle}>
+            <div style={loadingContentStyle}>
+              <div style={spinnerStyle}></div>
               <div style={{ 
-                color: '#f97316', 
+                color: '#f8fafc', 
+                fontSize: '1.1rem', 
                 fontWeight: 600,
-                fontSize: '0.85rem',
-                marginBottom: '4px',
-              }}>⚠️ Error</div>
+                fontFamily: 'Inter, system-ui, sans-serif'
+              }}>{loadingStep}</div>
               <div style={{ 
-                color: '#f97316',
-                fontFamily: 'JetBrains Mono, Fira Code, monospace',
-                fontSize: '0.75rem',
-                whiteSpace: 'pre-wrap',
+                color: '#94a3b8', 
+                fontSize: '0.85rem',
+                fontFamily: 'JetBrains Mono, Fira Code, monospace'
               }}>
-                {error}
+                Please wait while the Python environment initializes...
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Main Content Area */}
+        <div style={mainStyle}>
+          {/* Left Side - Code Editor */}
+          <div style={editorSectionStyle}>
+            <div style={toolbarStyle}>
+              <div style={toolbarInfoStyle}>
+                <span style={{
+                  background: 'rgba(6, 182, 212, 0.15)',
+                  color: '#06b6d4',
+                  fontSize: '0.65rem',
+                  fontWeight: 700,
+                  padding: '2px 8px',
+                  borderRadius: '4px',
+                  textTransform: 'uppercase',
+                }}>Python</span>
+                <span style={{ 
+                  color: '#94a3b8', 
+                  fontSize: '0.75rem' 
+                }}>workspace.py</span>
+              </div>
+              <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                <button
+                  style={botBtnStyle(true)}
+                  onClick={handleRunCode}
+                  disabled={isRunning || !pyodideInstance || isLoading}
+                  title="Run Code (Ctrl+Enter)"
+                >
+                  {isRunning ? (
+                    <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                      <span style={{
+                        display: 'inline-block',
+                        width: '8px',
+                        height: '8px',
+                        background: '#06b6d4',
+                        borderRadius: '50%',
+                        animation: 'pulse 1.2s ease-in-out infinite',
+                      }}></span>
+                      Running...
+                    </span>
+                  ) : (
+                    <span>▶ Run</span>
+                  )}
+                </button>
+                <button
+                  style={botBtnStyle(false)}
+                  onClick={handleCommit}
+                  disabled={isRunning || !pyodideInstance || isLoading}
+                  title="Commit changes to dataset"
+                >
+                  {isCommitted ? '✓ Saved' : '💾 Commit'}
+                </button>
+                <button
+                  style={{
+                    background: 'transparent',
+                    color: '#94a3b8',
+                    border: '1px solid #374151',
+                    borderRadius: '6px',
+                    padding: '8px 14px',
+                    fontSize: '0.8rem',
+                    cursor: 'pointer',
+                    transition: 'all 0.2s ease',
+                  }}
+                  onClick={handleReset}
+                  disabled={isRunning}
+                  title="Reset output"
+                >
+                  🔄 Reset
+                </button>
+              </div>
+            </div>
+
+            <div
+              ref={monacoContainerRef}
+              style={botStyle}
+            />
+          </div>
+
+          {/* Right Side - Output Panel */}
+          {showOutputPanel && (
+            <div style={outputSectionStyle}>
+              <div style={outputHeaderStyle}>
+                <span>Output</span>
+                <button 
+                  onClick={toggleOutputPanel}
+                  style={toggleBtnStyle}
+                  title="Toggle Output Panel"
+                >
+                  {showOutputPanel ? '←' : '→'}
+                </button>
+              </div>
+              
+              <div style={outputContainerStyle}>
+                {plots.length > 0 && (
+                  <div style={plotsSectionStyle}>
+                    <div style={{ 
+                      color: '#94a3b8', 
+                      fontSize: '0.7rem', 
+                      textTransform: 'uppercase',
+                      letterSpacing: '0.5px',
+                      marginBottom: '10px',
+                      paddingBottom: '8px',
+                      borderBottom: '1px solid #374151',
+                    }}>Matplotlib Plots</div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                      {plots.map((plot, idx) => (
+                        <div key={idx} style={plotCardStyle}>
+                          <img
+                            src={`data:image/png;base64,${plot}`}
+                            alt={`Plot ${idx + 1}`}
+                            style={{
+                              maxWidth: '100%',
+                              height: 'auto',
+                              borderRadius: '6px',
+                            }}
+                          />
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                
+                <div style={consoleStyle}>
+                  <pre style={{
+                    margin: 0,
+                    fontFamily: 'JetBrains Mono, Fira Code, monospace',
+                    fontSize: '0.75rem',
+                    lineHeight: 1.9,
+                    color: '#6ee7b7',
+                    whiteSpace: 'pre-wrap',
+                  }}>
+                    {output || 'Output will appear here...'}
+                  </pre>
+                </div>
               </div>
             </div>
           )}
         </div>
-      )}
+
+        {/* Error Section */}
+        {error && !isCommitted && (
+          <div style={errorSectionStyle}>
+            <div style={{ 
+              color: '#f97316', 
+              fontWeight: 600,
+              fontSize: '0.85rem',
+              marginBottom: '4px',
+            }}>⚠️ Error</div>
+            <div style={{ 
+              color: '#f97316',
+              fontFamily: 'JetBrains Mono, Fira Code, monospace',
+              fontSize: '0.75rem',
+              whiteSpace: 'pre-wrap',
+            }}>
+              {error}
+            </div>
+          </div>
+        )}
+      </div>
     </>
   );
 };
