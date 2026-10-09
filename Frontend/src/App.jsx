@@ -1,17 +1,21 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef, useCallback, lazy, Suspense } from "react";
 import Header from "./components/Header";
 import UploadView from "./components/UploadView";
 import PreviewView from "./components/PreviewView";
-import EdaView from "./components/EdaView";
 import ProcView from "./components/ProcView";
-import ResultsView from "./components/ResultsView";
 import EncodingModal from "./components/EncodingModal";
 import ChatAssistant from "./components/ChatAssistant";
 import ElectricBorder from "./components/ElectricBorder";
 import UndoRedoButton from "./components/UndoRedoButton";
-import PyodideSandbox from "./components/PyodideSandbox";
+import NotebookSandbox from "./components/NotebookSandbox";
 import { ActionHistoryProvider, useActionHistory } from "./context/ActionHistoryContext";
 import "./App.css";
+import { loadRuntime, updateDataFrame } from "./notebook/pyodideRuntime";
+
+// These two pages pull in Chart.js / Plotly (several MB). Loading them only when the
+// user actually reaches the page makes the first screen load much faster.
+const EdaView = lazy(() => import("./components/EdaView"));
+const ResultsView = lazy(() => import("./components/ResultsView"));
 
 function AppContent() {
   const [view, setView] = useState("v-upload");
@@ -30,7 +34,7 @@ function AppContent() {
   const [encodingModalData, setEncodingModalData] = useState(null);
   const [encodingConfig, setEncodingConfig] = useState({});
   const [sandboxOpen, setSandboxOpen] = useState(false);
-  const [sandboxEncodingRequired, setSandboxEncodingRequired] = useState(null);
+  const [syncLastModified, setSyncLastModified] = useState(0);
   const { recordAction } = useActionHistory();
 
   const handleFileUpload = async (file) => {
@@ -321,75 +325,42 @@ function AppContent() {
   const displayResults =
     results && selectedModelData ? { ...results, best_model: selectedModelData } : results;
 
-  // ── Sandbox Handlers ──
+  // ── Python Notebook ──
   const handleOpenSandbox = () => {
-    if (!taskId && !uploadData) {
-      alert("Please upload a dataset first before opening the sandbox.");
+    if (!uploadData) {
+      alert("Please upload a dataset first before opening the notebook.");
       return;
     }
     setSandboxOpen(true);
   };
 
-  const handleCloseSandbox = () => {
-    setSandboxOpen(false);
-    setSandboxEncodingRequired(null);
-  };
+  const handleCloseSandbox = () => setSandboxOpen(false);
 
-  const handleDatasetUpdate = (data) => {
-    if (data.processed_preview) {
-      setResults((prev) => ({
-        ...prev,
-        dataset_analysis: data.dataset_analysis,
-        processed_preview: data.processed_preview,
-        eda_payload: data.eda_payload,
-      }));
+  // Called by the notebook after the backend accepted a commit.
+  const handleNotebookCommit = (data) => {
+    setUploadData(data.dataset); // the whole app now uses the committed dataset
+    if (data.pipeline) {
+      // The pipeline had already run: show the recomputed preprocessing + EDA.
+      setResults((prev) => ({ ...prev, ...data.pipeline }));
     }
-    setSandboxOpen(false);
-    setSandboxEncodingRequired(null);
-    if (data.eda_payload && data.dataset_analysis && taskId) {
-      const cacheKey = `dataset_${taskId}`;
-      try {
-        localStorage.setItem(cacheKey, JSON.stringify({
-          lastSync: Date.now(),
-          columns: data.dataset_analysis.get('final_shape', [0, 0])[1],
-        }));
-      } catch (e) {}
-    }
-  };
 
-  const handleEncodingRequired = (encodingData) => {
-    setSandboxEncodingRequired(encodingData);
-    setSandboxOpen(false);
-  };
-
-  const handleSandboxEncodingConfirm = (newEncodingConfig) => {
-    const mergedConfig = {
-      ...sandboxEncodingRequired.temporary_state,
-      ...newEncodingConfig
-    };
-    setEncodingModalData({
-      categorical_cols: sandboxEncodingRequired.unmapped_columns,
-      cat_info: sandboxEncodingRequired.cat_info,
-      encoding_config: mergedConfig,
-      isFromSandbox: true
-    });
-    setSandboxEncodingRequired(null);
-  };
-
-  const handleEncodingSubmit = async (encodingConfig) => {
-    if (sandboxEncodingRequired?.isFromSandbox) {
-      const res = await fetch(`/api/sync_notebook_dataset/${taskId}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ encoding_config: encodingConfig })
+    // Same undo/redo mechanism as "Delete column": the backend keeps snapshots.
+    const stored_as = data.dataset.stored_as;
+    const callBackend = async (endpoint) => {
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ stored_as }),
       });
-      const data = await res.json();
-      if (data.status === 'success') {
-        handleDatasetUpdate(data);
-        alert('Dataset synchronized with encoding applied.');
-      }
-    }
-    setEncodingModalData(null);
+      if (res.ok) setUploadData(await res.json());
+    };
+    recordAction({
+      type: "NOTEBOOK_COMMIT",
+      description: data.dataset.last_action || "Notebook commit",
+      page: "Dataset Preview",
+      undo: () => callBackend("/api/undo_dataset"),
+      redo: () => callBackend("/api/redo_dataset"),
+    });
   };
 
   useEffect(() => {
@@ -446,6 +417,41 @@ function AppContent() {
     return () => clearInterval(interval);
   }, [taskId, view]);
 
+  // ── Real-time sync: poll backend for dataset updates while sandbox is open ──
+  useEffect(() => {
+    if (!sandboxOpen || !uploadData?.stored_as) return;
+    const stored_as = uploadData.stored_as;
+    let lastKnown = syncLastModified;
+
+    const poll = async () => {
+      try {
+        const res = await fetch(`/api/notebook/${stored_as}/sync`);
+        const data = await res.json();
+        if (data.last_modified && data.last_modified !== lastKnown) {
+          setSyncLastModified(data.last_modified);
+          // Update the Pyodide kernel's `df` in-place; user cells are preserved.
+          // Note: pyodide may not be loaded yet on the first poll; the error is caught below.
+          updateDataFrame(data.csv)
+            .then((result) => {
+              if (!result.ok) {
+                console.warn("Failed to update df in Pyodide:", result.error);
+              }
+            })
+            .catch((e) => {
+              // pyodide not loaded yet or other error — will retry on next interval
+              console.debug("Sync update deferred (pyodide not ready yet):", e.message);
+            });
+        }
+      } catch (e) {
+        console.error("Sync poll error:", e);
+      }
+    };
+
+    poll(); // initial fetch
+    const interval = setInterval(poll, 3000);
+    return () => clearInterval(interval);
+  }, [sandboxOpen, uploadData, syncLastModified]);
+
   const canNavigateTo = (stepId) => {
     if (stepId === "v-upload") return true;
     if (stepId === "v-preview") return Boolean(uploadData);
@@ -486,6 +492,7 @@ function AppContent() {
           />
         )}
 
+        <Suspense fallback={<div className="page-loading">Loading…</div>}>
         {view === "v-eda" && (
           <EdaView
             results={results}
@@ -503,8 +510,7 @@ function AppContent() {
                   }),
                 });
                 
-                if (!res.ok) throw new Error();
-                
+                if (!res.ok) throw new Error();                                
                 setElapsed(0);
                 setProcProgress(0);
                 setProcStep("Starting tournament...");
@@ -549,38 +555,24 @@ function AppContent() {
             }}
           />
         )}
+        </Suspense>
 
         {encodingModalData && (
           <EncodingModal
             cols={encodingModalData.categorical_cols}
             catInfo={encodingModalData.cat_info}
-            initialConfig={sandboxEncodingRequired?.temporary_state || encodingModalData.encoding_config}
-            onConfirm={(newConfig) => {
-              if (sandboxEncodingRequired) {
-                const mergedConfig = { ...sandboxEncodingRequired.temporary_state, ...newConfig };
-                handleDatasetUpdate({
-                  status: 'success',
-                  dataset_analysis: { encoding_config: mergedConfig },
-                  processed_preview: { columns: [], rows: [], total_rows: 0, total_cols: 0 },
-                  eda_payload: {}
-                });
-              } else {
-                startExecution(newConfig);
-              }
-            }}
+            initialConfig={encodingModalData.encoding_config}
+            onConfirm={(newConfig) => startExecution(newConfig)}
             onCancel={() => setEncodingModalData(null)}
           />
         )}
 
-        <PyodideSandbox
+        <NotebookSandbox
           isOpen={sandboxOpen}
           onClose={handleCloseSandbox}
-          taskId={taskId}
           uploadData={uploadData}
-          currentResults={results}
-          encodingConfig={encodingConfig}
-          onDatasetUpdate={handleDatasetUpdate}
-          onEncodingRequired={handleEncodingRequired}
+          taskId={taskId}
+          onCommitted={handleNotebookCommit}
         />
       </div>
 

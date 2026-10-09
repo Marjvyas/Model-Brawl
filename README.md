@@ -27,15 +27,15 @@ model_brawl/
 
 ### Key Components
 - `App.jsx` - Main application component with routing
-- `SandboxCard.jsx` - Dataset upload and management
+- `NotebookSandbox.jsx` - Jupyter-style Python notebook (runs in the browser via Pyodide)
 - `PreviewView.jsx` - Dataset preview with data manipulation tools
-- `ReversibilityBar.jsx` - Undo/Redo history for dataset changes
+- `UndoRedoButton.jsx` - Undo/Redo for dataset changes
 - `ElectricBorder.jsx` - Custom border component
 - `CustomSelect.jsx` - Enhanced select dropdown
 - `SvgIcon.jsx` - SVG icon component
 - `Header.jsx` - Application header
 - `ActionHistoryContext.jsx` - Context for managing undo/redo history
-- `ReversibilityBar.css`, `ElectricBorder.css`, etc. - Component styles
+- `notebook/nb_runtime.py` + `notebook/pyodideRuntime.js` - the in-browser Python "kernel" and its JS bridge
 
 ### API Integration
 The frontend communicates with the FastAPI backend at `http://localhost:8000`:
@@ -44,7 +44,6 @@ The frontend communicates with the FastAPI backend at `http://localhost:8000`:
 - `POST /api/prepare` - Prepare data for pipeline
 - `POST /api/run` - Run ML pipeline (preprocessing + EDA)
 - `POST /api/train` - Train models
-- `POST /api/train` - Get model details
 - `POST /api/model_details/{task_id}` - Get details for a specific model
 - `POST /api/update_dtypes` - Update column data types
 - `POST /api/delete_column` - Delete a column
@@ -53,6 +52,9 @@ The frontend communicates with the FastAPI backend at `http://localhost:8000`:
 - `POST /api/reset_dataset` - Reset dataset to original state
 - `POST /api/dataset_history` - Get undo/redo history status
 - `POST /api/chat` - Chat with AI about the dataset and results
+- `GET /api/notebook/{stored_as}/state` - Ordered steps (with code) behind the current dataset
+- `GET /api/notebook/{stored_as}/base` - The original upload (starting point for replaying steps)
+- `POST /api/notebook/{stored_as}/commit` - Apply notebook cells to the app's dataset
 
 ## Backend
 
@@ -74,7 +76,11 @@ The frontend communicates with the FastAPI backend at `http://localhost:8000`:
 - `POST /api/redo_dataset` - Redo undone change
 - `POST /api/reset_dataset` - Reset dataset to original state
 - `POST /api/dataset_history` - Get undo/redo history status
-- `POST /api/chat` - Chat with AI about dataset and results
+- `POST /api/chat` - Chat with AI about dataset and results (needs the `CHAT_API_KEY` environment variable, or a key typed into the chat settings)
+- `GET /api/notebook/{stored_as}/state`, `GET /api/notebook/{stored_as}/base`, `POST /api/notebook/{stored_as}/commit` - Python notebook (see below)
+
+### Python Notebook
+Notebook code runs in the browser (Pyodide); the server never executes it. Every dataset change (UI button or committed cells) is a step in `.uploads/.history/<file>/history.json`, stored with the Python code that produced it. Opening the notebook replays those steps on the original upload, so new cells continue exactly where the app is. Commit replaces the dataset and, if the pipeline already ran, recomputes preprocessing + EDA.
 
 ### ML Pipeline
 The backend includes a comprehensive ML pipeline that:
@@ -114,16 +120,17 @@ The backend includes a comprehensive ML pipeline that:
 ## Deployment
 
 ### Local Development
-1. Start the backend: `cd Backend && python main.py`
+0. First time only: `cd Backend && python -m venv venv && venv\Scripts\activate && pip install -r requirements.txt` and `cd Frontend && npm install`
+1. Start the backend: `cd Backend && uvicorn main:app --reload --port 8000`
 2. Start the frontend: `cd Frontend && npm run dev`
-3. Access the app at `http://localhost:5173`
+3. Access the app at `http://localhost:3000` (the port set in `vite.config.js`)
 4. API available at `http://localhost:8000`
 
 ### GitHub Deployment
 See the deployment instructions in the project wiki or follow these steps:
 
 1. Initialize git: `git init`
-2. Add all files: `git add .`
+2. Add all files: `git add .` (the root `.gitignore` keeps venv, node_modules and uploaded data out)
 3. Commit: `git commit -m "Initial commit"`
 4. Link to GitHub remote: `git remote add origin https://github.com/username/repo.git`
 5. Force push: `git push -u origin main --force`

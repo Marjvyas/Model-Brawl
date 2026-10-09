@@ -183,28 +183,7 @@ body {
   padding: 52px 0 12px;
   animation: fadeDown .7s var(--ease-out);
   position: relative;
-}
-
-.brand {
-  
-  display: inline-flex;
-  align-items: center;
-  gap: 14px;
-}
-
-.brand-word {
-  
-  font-family: var(--font-logo);
-  font-size: 2.5rem;
-  font-weight: 800;
-  letter-spacing: 2px;
-}
-
-.brand-word span {
-  color: #00FF66;
-  -webkit-text-fill-color: #00FF66;
-  filter: drop-shadow(0px 0px 12px rgba(0, 255, 102, 0.6));
-}
+} 
 
 .tagline {
   color: #748b74;
@@ -286,17 +265,6 @@ body {
   color: var(--accent-2);
 }
 
-/* Container holding your UploadView component */
-.upload-wrap {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  flex: 1; /* Pushes upload box into the vertical center of screen */
-  width: 100%;
-  max-width: 600px; /* Keeps the upload box focused and narrow */
-  margin: 0 auto; /* Centers horizontally */
-}
 
 /* ═══════════════════════════════════════════════════════════════════════════
    8. DATASET PREVIEW VIEW (PreviewView.jsx)
@@ -345,7 +313,6 @@ body {
 }
 
 .kpi-value.sm { font-size: .92rem; }
-.kpi-value.is-expanded { white-space: normal; word-break: break-word; }
 
 /* Table scroll wrapper for column preview */
 .tbl-wrap {
@@ -438,15 +405,6 @@ body {
   border-radius: var(--radius-m);
 }
 
-.mode-header {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 14px;
-  font-size: .82rem;
-  font-weight: 700;
-  color: var(--text-primary);
-}
 
 /* Pill shape toggle background track */
 .mode-toggle-wrap {
@@ -987,9 +945,7 @@ body {
 .champ-name {
   font-size: 1.6rem;
   font-weight: 800;
-  background: var(--accent-gradient-h);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
+  -webkit-text-fill-color: var(--text-main);
   margin-bottom: 16px;
   letter-spacing: -0.3px;
 }
@@ -1318,23 +1274,6 @@ body {
 /* ═══════════════════════════════════════════════════════════════════════════
    16. FLOATING CHAT ASSISTANT (ChatAssistant.jsx)
    ═══════════════════════════════════════════════════════════════════════════ */
-
-/* Floating round chat button (FAB) */
-.fab {
-  position: fixed;
-  bottom: 24px; right: 24px;
-  width: 110px; height: 110px;
-  background-color: transparent;
-  background-image: url('/static/bot_icon.png?v=2');
-  background-size: contain;
-  background-repeat: no-repeat;
-  background-position: center;
-  cursor: pointer;
-  z-index: 900;
-  transition: transform 0.4s var(--ease-spring);
-}
-
-.fab:hover { transform: scale(1.08); }
 
 /* Chat modal drawer panel — raised surface clearly distinct from the page bg */
 .chat-modal {

@@ -3,7 +3,6 @@ warnings.filterwarnings("ignore")
 
 import numpy as np # type: ignore
 import pandas as pd
-from scipy.stats import skew # type: ignore
 
 from sklearn.preprocessing import StandardScaler, PowerTransformer, OneHotEncoder, PolynomialFeatures, OrdinalEncoder
 from sklearn.experimental import enable_iterative_imputer
@@ -17,7 +16,6 @@ from sklearn.svm import SVR
 from sklearn.metrics import r2_score, mean_squared_error
 from sklearn.feature_selection import mutual_info_regression
 from sklearn.preprocessing import TargetEncoder
-from sklearn.base import BaseEstimator, TransformerMixin
 import re
 
 

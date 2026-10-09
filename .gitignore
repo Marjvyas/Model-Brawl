@@ -1,0 +1,22 @@
+# Python
+Backend/venv/
+Frontend/venv/
+__pycache__/
+*.pyc
+
+# User data created while the app runs (uploaded CSVs, history snapshots, parquet caches)
+Backend/.uploads/
+
+# Node
+Frontend/node_modules/
+Frontend/dist/
+
+# Tool / editor folders
+.kilo/
+.kilocode/
+.vscode/
+.idea/
+.DS_Store
+
+# Secrets
+.env

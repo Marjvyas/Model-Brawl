@@ -1,7 +1,5 @@
 import React, { useState, useRef, useEffect } from "react";
-import Plotly from "plotly.js-dist-min";
 import bot_icon from "../assets/bot_icon.png";
-import "./FloatingIcon.css";
 
 /**
  * ChatAssistant — Floating Data-Analyst chatbot widget.
@@ -103,6 +101,8 @@ function ChatAssistant({ upload, results, currentView }) {
       } else if (currentView === "v-eda") {
         document.querySelectorAll("#v-eda .visual-canvas-wrap canvas").forEach(pushCanvas);
         const heatmap = document.getElementById("eda-heatmap");
+        // Plotly is huge, so it is only downloaded when a heatmap screenshot is needed.
+        const Plotly = heatmap ? (await import("plotly.js-dist-min")).default : null;
         if (heatmap && Plotly && typeof Plotly.toImage === "function") {
           const url = await Plotly.toImage(heatmap, { format: "png", width: 1000, scale: 1 });
           if (url) images.push(url);

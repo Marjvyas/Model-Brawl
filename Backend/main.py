@@ -9,6 +9,7 @@ from starlette.responses import HTMLResponse
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi import WebSocket  # ADD THIS
 import os
 import pandas as pd
 import json
@@ -18,7 +19,7 @@ import time
 import numpy as np
 import requests
 import re
-from typing import List
+from typing import List, Optional
 
 app= FastAPI(title="Model Brawl", version="1.0.0")
 
@@ -26,7 +27,7 @@ app= FastAPI(title="Model Brawl", version="1.0.0")
 # 1. Define paths relative to main.py
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Point to the React build folder in the separate directory
-REACT_BUILD_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "frontend", "dist"))
+REACT_BUILD_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "Frontend", "dist"))
 ASSETS_DIR = os.path.join(REACT_BUILD_DIR, "assets")
 UPLOAD_DIR = os.path.join(BASE_DIR, ".uploads")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -100,10 +101,21 @@ def _load_history_meta(stored_as: str) -> dict:
 
 def _save_history_meta(stored_as: str, meta: dict):
     meta_path = _get_history_meta_path(stored_as)
+    # Add last_modified timestamp if not present
+    if "last_modified" not in meta:
+        meta["last_modified"] = time.time()
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 
-def _record_dataset_snapshot(stored_as: str, action_desc: str, df: pd.DataFrame):
+def _record_dataset_snapshot(stored_as: str, action_desc: str, df: pd.DataFrame,
+                             code: str = None, origin: str = "ui", cells: list = None):
+    """
+    Save a snapshot of the dataset AFTER an action, plus (optionally) the Python
+    code that produced it. The code is what lets the Python Notebook rebuild its
+    state by replaying every step in order:
+        origin="ui"       -> a button in the app (delete column, change dtype...)
+        origin="notebook" -> cells the user committed from the notebook
+    """
     safe_stored_as = os.path.basename(stored_as)
     folder = _get_history_folder(safe_stored_as)
     meta = _load_history_meta(safe_stored_as)
@@ -132,10 +144,14 @@ def _record_dataset_snapshot(stored_as: str, action_desc: str, df: pd.DataFrame)
         "action": action_desc,
         "timestamp": time.time(),
         "columns": list(df.columns),
-        "rows": int(len(df))
+        "rows": int(len(df)),
+        "origin": origin,
+        "code": code,
+        "cells": cells,
     })
     meta["steps"] = steps
     meta["current_index"] = len(steps) - 1
+    meta["last_modified"] = time.time()  # Always update last_modified
     _save_history_meta(safe_stored_as, meta)
 
 def _undo_dataset_snapshot(stored_as: str) -> tuple:
@@ -209,7 +225,8 @@ def _reset_dataset_snapshot(stored_as: str) -> tuple:
     main_file_path = os.path.join(UPLOAD_DIR, safe_stored_as)
     df.to_csv(main_file_path, index=False)
 
-    _record_dataset_snapshot(safe_stored_as, "Reset dataset to original", df)
+    _record_dataset_snapshot(safe_stored_as, "Reset dataset to original", df,
+                             code="df = _base_df.copy()")
     return df, "Reset dataset to original"
 
 def _build_dataset_response(df: pd.DataFrame, stored_as: str, filename: str = None) -> dict:
@@ -245,6 +262,32 @@ def _build_dataset_response(df: pd.DataFrame, stored_as: str, filename: str = No
         "can_redo": 0 <= current_idx < len(steps) - 1,
         "history": [s["action"] for s in steps[:current_idx + 1]],
         "last_action": steps[current_idx]["action"] if 0 <= current_idx < len(steps) else None,
+    }
+
+
+# ── Small shared helpers ───────────────────────────────────
+
+def _write_parquet_cache(task_id: str, X_train, X_test, y_train, y_test):
+    """Save the processed matrices so later steps (EDA, training) don't recompute them."""
+    cache_dir = os.path.join(UPLOAD_DIR, task_id)
+    os.makedirs(cache_dir, exist_ok=True)
+    X_train.to_parquet(os.path.join(cache_dir, "X_train.parquet"))
+    X_test.to_parquet(os.path.join(cache_dir, "X_test.parquet"))
+    pd.DataFrame(y_train).to_parquet(os.path.join(cache_dir, "y_train.parquet"))
+    pd.DataFrame(y_test).to_parquet(os.path.join(cache_dir, "y_test.parquet"))
+
+
+def _make_processed_preview(X_train, y_train, target_col_name: str) -> dict:
+    """First 10 rows of the processed training data, shaped for the frontend table."""
+    preview_df = X_train.head(10).copy()
+    preview_df[target_col_name] = y_train.head(10).values
+    for col in preview_df.select_dtypes(include=["float64", "float32"]).columns:
+        preview_df[col] = preview_df[col].round(4)
+    return {
+        "columns": list(preview_df.columns),
+        "rows": json.loads(preview_df.to_json(orient="records")),
+        "total_rows": len(X_train),
+        "total_cols": len(preview_df.columns),
     }
 
 
@@ -321,30 +364,39 @@ def _run_eda_task(task_id: str, file_path: str, stored_as: str):
         # ── Cache matrices to .parquet ──
         tasks[task_id]["step"] = "Caching intermediate data..."
         tasks[task_id]["progress"] = 25
-        cache_dir = os.path.join(UPLOAD_DIR, task_id)
-        os.makedirs(cache_dir, exist_ok=True)
-        
-        X_train.to_parquet(os.path.join(cache_dir, "X_train.parquet"))
-        X_test.to_parquet(os.path.join(cache_dir, "X_test.parquet"))
-        pd.DataFrame(y_train).to_parquet(os.path.join(cache_dir, "y_train.parquet"))
-        pd.DataFrame(y_test).to_parquet(os.path.join(cache_dir, "y_test.parquet"))
+        _write_parquet_cache(task_id, X_train, X_test, y_train, y_test)
         
         # ── Build processed dataset preview (first 10 rows) ──
         target_col = preprocessing_report.get("target_column", "target")
-        preview_df = X_train.head(10).copy()
-        preview_df[target_col] = y_train.head(10).values
-        # Round floats to 4 decimal places for cleaner display
-        for col in preview_df.select_dtypes(include=["float64", "float32"]).columns:
-            preview_df[col] = preview_df[col].round(4)
-        processed_preview = {
-            "columns": list(preview_df.columns),
-            "rows": json.loads(preview_df.to_json(orient="records")),
-            "total_rows": len(X_train),
-            "total_cols": len(preview_df.columns),
-        }
+        processed_preview = _make_processed_preview(X_train, y_train, target_col)
 
         # Save preprocessing report to memory for the tournament phase
         tasks[task_id]["preprocessing_report"] = preprocessing_report
+        
+        # ── Add to Notebook History ──
+        import pandas as pd
+        X_all = pd.concat([X_train, X_test])
+        y_all = pd.concat([y_train, y_test])
+        df_processed = X_all.copy()
+        df_processed[target_col] = y_all
+        df_processed = df_processed.sort_index()
+
+        safe_stored_as = os.path.basename(stored_as)
+        meta = _load_history_meta(safe_stored_as)
+        next_step_id = meta.get("current_index", -1) + 1
+
+        code_str = f"""# ── Automated Preprocessing Pipeline ──
+# Dropped nulls, handled missing values, encoded categoricals, and scaled features.
+from pyodide.http import open_url
+import pandas as pd
+import io
+
+# The preprocessed data was saved by the backend. We load it directly:
+url = f"/api/notebook/{safe_stored_as}/snapshot/{next_step_id}"
+csv_data = open_url(url).read()
+df = pd.read_csv(io.StringIO(csv_data))
+"""
+        _record_dataset_snapshot(stored_as, "Automated Preprocessing Pipeline", df_processed, code=code_str, origin="pipeline")
         
         # ── Finish Phase 1 ──
         tasks[task_id]["results"] = {
@@ -677,19 +729,22 @@ async def update_dtypes(req: UpdateDtypesRequest):
             _record_dataset_snapshot(stored_as, "Initial State", df)
 
         changes = []
+        code_lines = []   # the same change, written as pandas code (for the notebook replay)
         for col, new_type in req.dtypes.items():
             if col in df.columns:
                 old_dtype = str(df[col].dtype)
                 if new_type == "numeric":
                     df[col] = pd.to_numeric(df[col], errors="coerce")
                     changes.append(f"{col} ({old_dtype} → numeric)")
+                    code_lines.append(f'df[{col!r}] = pd.to_numeric(df[{col!r}], errors="coerce")')
                 elif new_type == "string":
                     df[col] = df[col].astype(str)
                     changes.append(f"{col} ({old_dtype} → string)")
+                    code_lines.append(f"df[{col!r}] = df[{col!r}].astype(str)")
                     
         df.to_csv(file_path, index=False)
         action_msg = f"Update dtype: {', '.join(changes) if changes else 'Type modified'}"
-        _record_dataset_snapshot(stored_as, action_msg, df)
+        _record_dataset_snapshot(stored_as, action_msg, df, code="\n".join(code_lines))
         
         return _build_dataset_response(df, stored_as)
     except Exception as e:
@@ -728,7 +783,8 @@ async def delete_column(body: dict):
     df = df.drop(columns=[col_name])
     df.to_csv(file_path, index=False)
     
-    _record_dataset_snapshot(stored_as, f"Delete column '{col_name}'", df)
+    _record_dataset_snapshot(stored_as, f"Delete column '{col_name}'", df,
+                             code=f"df = df.drop(columns=[{col_name!r}])")
     return _build_dataset_response(df, stored_as)
 
 @app.post("/api/undo_dataset")
@@ -801,12 +857,63 @@ async def dataset_history(body: dict):
         "can_undo": current_idx > 0,
         "can_redo": 0 <= current_idx < len(steps) - 1,
         "current_index": current_idx,
-        "steps": steps
+        "steps": steps,
+        "last_modified": meta.get("last_modified", 0)
     }
 
-@app.post("/api/undo_delete")
-async def undo_delete(body: dict):
-    return await undo_dataset(body)
+
+# ── Synchronization Endpoints ──────────────────────────────────
+@app.get("/api/notebook/{stored_as}/sync")
+async def notebook_sync(stored_as: str):
+    """Return current dataset CSV and last_modified timestamp for sync."""
+    safe_stored_as = os.path.basename(stored_as)
+    file_path = os.path.join(UPLOAD_DIR, safe_stored_as)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    df = _read_csv_safe(file_path)
+    meta = _load_history_meta(safe_stored_as)
+    csv_data = df.to_csv(index=False)
+    
+    return {
+        "csv": csv_data,
+        "last_modified": meta.get("last_modified", 0),
+        "rows": df.shape[0],
+        "columns": df.shape[1],
+        "columns_list": list(df.columns),
+    }
+
+
+@app.websocket("/ws/notebook/{stored_as}")
+async def notebook_ws(websocket: WebSocket, stored_as: str):
+    """WebSocket for real-time dataset synchronization."""
+    await websocket.accept()
+    safe_stored_as = os.path.basename(stored_as)
+    file_path = os.path.join(UPLOAD_DIR, safe_stored_as)
+    
+    try:
+        # Send initial state
+        if os.path.exists(file_path):
+            df = _read_csv_safe(file_path)
+            meta = _load_history_meta(safe_stored_as)
+            await websocket.send_json({
+                "type": "init",
+                "csv": df.to_csv(index=False),
+                "last_modified": meta.get("last_modified", 0),
+                "rows": df.shape[0],
+                "columns": df.shape[1],
+            })
+        
+        # Keep connection alive and wait for client to disconnect
+        while True:
+            # Wait for any message from client (keepalive)
+            data = await websocket.receive_text()
+            if data == "ping":
+                await websocket.send_text("pong")
+    except Exception:
+        pass
+    finally:
+        await websocket.close()
 
 def _execute_df_code(code_str: str, df: pd.DataFrame):
     """Executes Python code against DataFrame `df` and returns the output or result variable."""
@@ -932,7 +1039,9 @@ def _build_page_context(current_view, pipeline_results):
 def chat_endpoint(body: dict):
     stored_as = body.get("stored_as")
     message = body.get("message", "")
-    api_key = body.get("api_key", "").strip() or "sk-198dd023f5b48ae8-35aea8-5770028a"
+    # Never hard-code secrets in source code. Set CHAT_API_KEY in your environment
+    # (see the guide) or let the user type one into the chat settings.
+    api_key = body.get("api_key", "").strip() or os.environ.get("CHAT_API_KEY", "")
     base_url = body.get("base_url", "").strip() or "http://localhost:20128/v1"
     model_name = body.get("model", "").strip() or "auto"
     chat_history = body.get("history", [])
@@ -1204,38 +1313,6 @@ DO NOT output any internal scratchpad outside your final markdown response."""
         return {"response": f"I encountered an error: {str(e)}"}
 
 
-# ── Dataset Endpoint for Sandbox ───────────────────────────
-@app.get("/api/dataset/{task_id}")
-async def get_dataset_csv(task_id: str):
-    """Returns the cached training data as CSV for Pyodide sandbox."""
-    if task_id not in tasks:
-        raise HTTPException(status_code=404, detail="Task not found.")
-    
-    cache_dir = os.path.join(UPLOAD_DIR, task_id)
-    parquet_path = os.path.join(cache_dir, "X_train.parquet")
-    
-    if not os.path.exists(parquet_path):
-        # Fallback: try to serve the original uploaded file
-        stored_as = tasks[task_id].get("stored_as")
-        if stored_as:
-            file_path = os.path.join(UPLOAD_DIR, stored_as)
-            if os.path.exists(file_path):
-                return FileResponse(file_path, media_type="text/csv")
-        raise HTTPException(status_code=404, detail="Dataset not found.")
-    
-    try:
-        X_train = pd.read_parquet(parquet_path)
-        y_train = pd.read_parquet(os.path.join(cache_dir, "y_train.parquet")).iloc[:, 0]
-        target_col = tasks[task_id].get("preprocessing_report", {}).get("target_column", "target")
-        X_train[target_col] = y_train.values
-        
-        from fastapi.responses import Response
-        csv_data = X_train.to_csv(index=False)
-        return Response(content=csv_data, media_type="text/csv")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 # ── Raw Dataset Endpoint for Pre-Pipeline Sandbox ───────────────────
 @app.get("/api/raw_dataset/{stored_as}")
 async def get_raw_dataset(stored_as: str):
@@ -1249,162 +1326,231 @@ async def get_raw_dataset(stored_as: str):
     return FileResponse(file_path, media_type="text/csv")
 
 
-# ── Notebook Sync Endpoint ────────────────────────────────
-class NotebookSyncRequest(BaseModel):
-    csv_data: str = ""
-    encoding_config: dict = {}
-    commit_message: str = ""
+# ═══════════════════════════════════════════════════════════
+#  PYTHON NOTEBOOK  (Python runs in the BROWSER, the server keeps the books)
+# ═══════════════════════════════════════════════════════════
+# Important design rule: the server NEVER executes notebook code.
+# Notebook cells run inside the user's browser (Pyodide). The server only
+#   1. tells the browser which earlier steps to replay      -> /state and /base
+#   2. receives the resulting dataset when the user commits  -> /commit
+#
+# Every dataset change (UI button OR committed notebook cells) is one "step" in
+# the history stored by _record_dataset_snapshot(), together with the code that
+# produced it. Replaying the steps in order on the original upload rebuilds
+# exactly the dataset you see in the app.
 
-@app.post("/api/sync_notebook_dataset/{task_id}")
-async def sync_notebook_dataset(task_id: str, body: Request):
-    """
-    Accepts modified dataset from the browser-side Python sandbox.
-    Performs Ghost Purge to remove deleted columns, Delta Check for
-    new categorical columns, and re-runs Phase 2 if clean.
-    """
-    if task_id not in tasks:
-        raise HTTPException(status_code=404, detail="Task not found.")
-    
-    task = tasks[task_id]
-    stored_as = task.get("stored_as")
-    if not stored_as:
-        raise HTTPException(status_code=400, detail="No stored file reference found for this task.")
-    
+@app.get("/api/notebook/{stored_as}/state")
+async def notebook_state(stored_as: str):
+    """The ordered list of steps (with code) that lead to the current dataset."""
+    stored_as = os.path.basename(stored_as)
     file_path = os.path.join(UPLOAD_DIR, stored_as)
     if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="Original uploaded file not found.")
-    
-    try:
-        content_type = body.headers.get("content-type", "")
-        
-        if "application/json" in content_type:
-            json_data = await body.json()
-            csv_body = json_data.get("csv_data", "")
-            user_encoding_config = json_data.get("encoding_config", {})
-        else:
-            csv_body = await body.body()
-            if isinstance(csv_body, bytes):
-                csv_body = csv_body.decode('utf-8')
-            user_encoding_config = {}
-        
-        if not csv_body or len(csv_body.strip()) == 0:
-            raise HTTPException(status_code=400, detail="Empty dataset received.")
-        
-        from io import StringIO
-        raw_df = pd.read_csv(StringIO(csv_body))
-        
-        if raw_df.shape[1] < 2:
-            raise HTTPException(status_code=400, detail="Dataset must have at least 2 columns.")
-        
-        target_col = raw_df.columns[-1]
-        target_dtype = str(raw_df[target_col].dtype).lower()
-        if 'object' in target_dtype or 'category' in target_dtype or 'string' in target_dtype:
-            if raw_df[target_col].nunique() < 15:
-                raise ValueError(f"Target column '{target_col}' appears to be categorical or text. This is a classification problem.")
-        
-        if target_col in raw_df.columns[:-1]:
-            ordered_cols = [c for c in raw_df.columns if c != target_col] + [target_col]
-            raw_df = raw_df[ordered_cols]
-        
-        meta = _load_history_meta(stored_as)
-        if not meta.get("steps"):
-            _record_dataset_snapshot(stored_as, "Initial State", raw_df)
-        
-        base_encoding_config = task.get("encoding_config", {})
-        active_cols = set(raw_df.columns)
-        
-        reconciled_config = {
-            k: v for k, v in base_encoding_config.items() 
-            if k in active_cols
+        raise HTTPException(status_code=404, detail="Dataset not found.")
+
+    meta = _load_history_meta(stored_as)
+    steps = meta.get("steps", [])
+    idx = meta.get("current_index", -1)
+
+    if not steps or idx < 0:
+        # Brand-new upload with no history yet: the file itself is the starting point.
+        df = _read_csv_safe(file_path)
+        return {
+            "has_history": False,
+            "replayable": True,
+            "steps": [],
+            "expected": {"columns": [str(c) for c in df.columns], "rows": int(len(df))},
         }
-        for k, v in user_encoding_config.items():
-            if k in active_cols:
-                reconciled_config[k] = v
-        
-        temp_df = raw_df.copy()
-        
+
+    active = steps[: idx + 1]          # steps after an undo are not part of the present
+    # Step 0 is the original upload (no code needed). Every later step needs code to be replayable;
+    # history written by older versions of this app has no code -> not replayable.
+    replayable = all(st.get("code") is not None for st in active[1:])
+    return {
+        "has_history": True,
+        "replayable": replayable,
+        "steps": [
+            {
+                "step_id": st["step_id"],
+                "action": st["action"],
+                "origin": st.get("origin", "ui"),
+                "code": st.get("code"),
+                "cells": st.get("cells"),
+            }
+            for st in active
+        ],
+        "expected": {"columns": [str(c) for c in active[-1]["columns"]], "rows": active[-1]["rows"]},
+    }
+
+
+@app.get("/api/notebook/{stored_as}/base")
+async def notebook_base(stored_as: str):
+    """The ORIGINAL upload (history step 0): the starting point for replaying steps."""
+    stored_as = os.path.basename(stored_as)
+    steps = _load_history_meta(stored_as).get("steps", [])
+    if steps:
+        snap = os.path.join(_get_history_folder(stored_as), steps[0]["file"])
+        if os.path.exists(snap):
+            return FileResponse(snap, media_type="text/csv")
+    file_path = os.path.join(UPLOAD_DIR, stored_as)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Dataset not found.")
+    return FileResponse(file_path, media_type="text/csv")
+
+
+def _rebuild_pipeline_cache(task_id: str, task: dict, df: pd.DataFrame, user_encoding: dict):
+    """
+    Re-run Phase 1 + Phase 2 on `df` (plus the task's Feature Forge recipes) and refresh
+    the cached matrices, so the EDA page and the tournament see the committed data.
+
+    Returns (needs_encoding_response, pipeline_payload). Exactly one of them is None.
+    Raises ValueError for problems the user should read (bad target, recipe broken by the code...).
+    """
+    recipe_book = task.get("recipe_book") or None
+    try:
         (X_train_cat, X_test_cat, X_train_cont, X_test_cont,
-         y_train, y_test, categorical_cols, continuous_cols, target_col_name,
+         y_train, y_test, categorical_cols, continuous_cols, target_col,
          original_shape, duplicates_removed, null_target_rows,
          columns_dropped_high_null, target_skewness, target_transform_applied,
-         final_shape, index_cols_to_drop) = ml_pipeline.imp_phase1(
-             temp_df, recipe_book=None
-         )
-        
-        unmapped_new_columns = [col for col in categorical_cols if col not in reconciled_config]
-        
-        if unmapped_new_columns:
-            cat_info = {}
-            for col in unmapped_new_columns:
-                unique_vals = X_train_cat[col].unique().tolist() if col in X_train_cat.columns else []
-                if len(unique_vals) > 50:
-                    unique_vals = unique_vals[:50]
-                cat_info[col] = unique_vals
-            
-            return {
-                "status": "needs_encoding",
-                "message": "New categorical columns detected from your sandbox modifications.",
-                "unmapped_columns": unmapped_new_columns,
-                "cat_info": cat_info,
-                "temporary_state": reconciled_config
-            }
-        
-        X_train_final, X_test_final, y_train, y_test, preprocessing_report = ml_pipeline.imp_phase2(
-            X_train_cat, X_test_cat, X_train_cont, X_test_cont,
-            y_train, y_test, categorical_cols, continuous_cols, target_col_name,
-            original_shape, duplicates_removed, null_target_rows,
-            columns_dropped_high_null, target_skewness, target_transform_applied, final_shape,
-            index_cols_to_drop=index_cols_to_drop,
-            encoding_config=reconciled_config
-        )
-        
-        cache_dir = os.path.join(UPLOAD_DIR, task_id)
-        os.makedirs(cache_dir, exist_ok=True)
-        
-        X_train_final.to_parquet(os.path.join(cache_dir, "X_train.parquet"))
-        X_test_final.to_parquet(os.path.join(cache_dir, "X_test.parquet"))
-        pd.DataFrame(y_train).to_parquet(os.path.join(cache_dir, "y_train.parquet"))
-        pd.DataFrame(y_test).to_parquet(os.path.join(cache_dir, "y_test.parquet"))
-        
-        temp_df.to_csv(file_path, index=False)
-        
-        task["preprocessing_report"] = preprocessing_report
-        task["encoding_config"] = reconciled_config
-        task["recipe_book"] = []
-        
-        target_col_name = preprocessing_report.get("target_column", "target")
-        preview_df = X_train_final.head(10).copy()
-        preview_df[target_col_name] = y_train.head(10).values
-        for col in preview_df.select_dtypes(include=["float64", "float32"]).columns:
-            preview_df[col] = preview_df[col].round(4)
-        processed_preview = {
-            "columns": list(preview_df.columns),
-            "rows": json.loads(preview_df.to_json(orient="records")),
-            "total_rows": len(X_train_final),
-            "total_cols": len(preview_df.columns),
-        }
-        
-        if "results" in task and task["results"]:
-            task["results"]["dataset_analysis"] = preprocessing_report
-            task["results"]["processed_preview"] = processed_preview
-            task["results"]["eda_payload"] = preprocessing_report.get("eda_payload", {})
-        
-        _record_dataset_snapshot(stored_as, "Sandbox Commit: Apply modifications from Python notebook", temp_df)
-        
-        return {
-            "status": "success",
-            "message": "Dataset synchronized successfully.",
-            "eda_payload": preprocessing_report.get("eda_payload", {}),
-            "processed_preview": processed_preview,
-            "dataset_analysis": preprocessing_report
-        }
-    
+         final_shape, index_cols_to_drop) = ml_pipeline.imp_phase1(df.copy(), recipe_book=recipe_book)
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        if recipe_book and ("Formula" in str(e) or "Recipe" in str(e)):
+            raise ValueError(
+                f"{e}  (Your notebook code probably removed or renamed a column that a "
+                f"Feature Forge recipe needs.)"
+            )
+        raise
+
+    # Keep earlier encoding choices, but only for columns that are still categorical.
+    merged = {**task.get("encoding_config", {}), **(user_encoding or {})}
+    reconciled = {k: v for k, v in merged.items() if k in set(categorical_cols)}
+
+    unmapped = [c for c in categorical_cols if c not in reconciled]
+    if unmapped:
+        cat_info = {c: X_train_cat[c].unique().tolist()[:50] for c in unmapped}
+        return ({
+            "status": "needs_encoding",
+            "message": "Your code created new categorical columns. Choose how to encode them.",
+            "unmapped_columns": unmapped,
+            "cat_info": cat_info,
+            "temporary_state": reconciled,
+        }, None)
+
+    X_train_final, X_test_final, y_train, y_test, report = ml_pipeline.imp_phase2(
+        X_train_cat, X_test_cat, X_train_cont, X_test_cont,
+        y_train, y_test, categorical_cols, continuous_cols, target_col,
+        original_shape, duplicates_removed, null_target_rows,
+        columns_dropped_high_null, target_skewness, target_transform_applied, final_shape,
+        index_cols_to_drop=index_cols_to_drop, encoding_config=reconciled,
+    )
+    _write_parquet_cache(task_id, X_train_final, X_test_final, y_train, y_test)
+
+    preview = _make_processed_preview(X_train_final, y_train, report.get("target_column", "target"))
+    task["preprocessing_report"] = report
+    task["encoding_config"] = reconciled
+    if task.get("results"):
+        task["results"]["dataset_analysis"] = report
+        task["results"]["processed_preview"] = preview
+        task["results"]["eda_payload"] = report.get("eda_payload", {})
+
+    return None, {
+        "dataset_analysis": report,
+        "processed_preview": preview,
+        "eda_payload": report.get("eda_payload", {}),
+    }
+
+
+class NotebookCommitRequest(BaseModel):
+    csv_data: str                    # the dataset AFTER the cells ran (df.to_csv)
+    cells: List[str]                 # the committed cells' code, top to bottom
+    encoding_config: dict = {}       # only sent after the encoding dialog
+    task_id: Optional[str] = None    # set when the pipeline has already run
+
+
+@app.post("/api/notebook/{stored_as}/commit")
+async def notebook_commit(stored_as: str, req: NotebookCommitRequest):
+    """
+    Make the notebook's result the dataset of the whole app:
+      * the dataset file is replaced and a new history step (with the code) is recorded,
+      * if the pipeline already ran, Phase 1/2 + EDA are recomputed from the new data.
+    Nothing is written unless every check passes.
+    """
+    stored_as = os.path.basename(stored_as)
+    file_path = os.path.join(UPLOAD_DIR, stored_as)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Dataset not found.")
+
+    cells = [c for c in req.cells if c.strip()]
+    if not cells:
+        raise HTTPException(status_code=400, detail="Nothing to commit - the cells are empty.")
+
+    current_df = _read_csv_safe(file_path)
+    target_col = current_df.columns[-1]       # this app treats the LAST column as the target
+
+    try:
+        new_df = pd.read_csv(io.StringIO(req.csv_data))
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=400, detail=f"Could not read the notebook's dataset: {e}")
+
+
+
+    if len(new_df) == 0:
+        raise HTTPException(status_code=400, detail="The dataset has no rows left after your code.")
+    if target_col not in new_df.columns:
+        raise HTTPException(
+            status_code=400,
+            detail=f"The target column '{target_col}' no longer exists in df. Keep it (the app predicts it).",
+        )
+
+    warnings = []
+    step_code = "\n\n".join(cells)
+    if new_df.columns[-1] != target_col:
+        # `df["new"] = ...` appends the new column LAST, which would silently make it the target.
+        new_df = new_df[[c for c in new_df.columns if c != target_col] + [target_col]]
+        warnings.append(f"Target column '{target_col}' was moved back to the last position.")
+        # Write the fix into the stored code too, so replaying the history gives the SAME dataset.
+        step_code += (
+            "\n\n# (added by the app) keep the target column last\n"
+            f"df = df[[c for c in df.columns if c != {target_col!r}] + [{target_col!r}]]"
+        )
+    if new_df.shape[1] < 2:
+        raise HTTPException(status_code=400, detail="The dataset needs at least 2 columns (features + target).")
+
+    # If the pipeline already ran for this dataset, rebuild its cache first.
+    # (Nothing has been saved yet, so any error leaves the project untouched.)
+    task = tasks.get(req.task_id) if req.task_id else None
+    if task is not None and task.get("stored_as") != stored_as:
+        task = None
+    pipeline_payload = None
+    if task is not None:
+        try:
+            needs_encoding, pipeline_payload = _rebuild_pipeline_cache(
+                req.task_id, task, new_df, req.encoding_config
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        if needs_encoding:
+            return needs_encoding
+
+    # All good -> persist: dataset file + a history step that carries the code.
+    if not _load_history_meta(stored_as).get("steps"):
+        _record_dataset_snapshot(stored_as, "Initial State", current_df)
+    new_df.to_csv(file_path, index=False)
+    n = len(cells)
+    _record_dataset_snapshot(
+        stored_as,
+        f"Notebook commit ({n} cell{'s' if n != 1 else ''})",
+        new_df,
+        code=step_code,
+        origin="notebook",
+        cells=cells,
+    )
+
+    return {
+        "status": "success",
+        "dataset": _build_dataset_response(new_df, stored_as),
+        "pipeline": pipeline_payload,
+        "warnings": warnings,
+    }
 
 
 # ── Status Endpoint ────────────────────────────────────────
@@ -1522,12 +1668,7 @@ async def feature_forge_update(task_id: str, req: FeatureForgeRequest):
         )
 
         # Re-cache the updated parquet files
-        cache_dir = os.path.join(UPLOAD_DIR, task_id)
-        os.makedirs(cache_dir, exist_ok=True)
-        X_train_final.to_parquet(os.path.join(cache_dir, "X_train.parquet"))
-        X_test_final.to_parquet(os.path.join(cache_dir, "X_test.parquet"))
-        pd.DataFrame(y_train).to_parquet(os.path.join(cache_dir, "y_train.parquet"))
-        pd.DataFrame(y_test).to_parquet(os.path.join(cache_dir, "y_test.parquet"))
+        _write_parquet_cache(task_id, X_train_final, X_test_final, y_train, y_test)
 
         # Update the task's preprocessing report & encoding config
         task["preprocessing_report"] = preprocessing_report
@@ -1536,16 +1677,7 @@ async def feature_forge_update(task_id: str, req: FeatureForgeRequest):
 
         # Build processed preview
         target_col_name = preprocessing_report.get("target_column", "target")
-        preview_df = X_train_final.head(10).copy()
-        preview_df[target_col_name] = y_train.head(10).values
-        for col in preview_df.select_dtypes(include=["float64", "float32"]).columns:
-            preview_df[col] = preview_df[col].round(4)
-        processed_preview = {
-            "columns": list(preview_df.columns),
-            "rows": json.loads(preview_df.to_json(orient="records")),
-            "total_rows": len(X_train_final),
-            "total_cols": len(preview_df.columns),
-        }
+        processed_preview = _make_processed_preview(X_train_final, y_train, target_col_name)
 
         # Update task results so the train endpoint picks up the new data
         if "results" in task and task["results"]:
@@ -1622,6 +1754,17 @@ async def recalculate_eda(task_id: str, req: RecalculateEDARequest):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/notebook/{stored_as}/snapshot/{step_id}")
+async def get_notebook_snapshot(stored_as: str, step_id: int):
+    safe_stored_as = os.path.basename(stored_as)
+    folder = _get_history_folder(safe_stored_as)
+    snap_path = os.path.join(folder, f"snap_{step_id}.csv")
+    if os.path.exists(snap_path):
+        from fastapi.responses import FileResponse
+        return FileResponse(snap_path, media_type="text/csv")
+    raise HTTPException(status_code=404, detail="Snapshot not found")
 
 @app.get("/{full_path:path}", response_class=HTMLResponse)
 async def serve_react_app(full_path: str):
